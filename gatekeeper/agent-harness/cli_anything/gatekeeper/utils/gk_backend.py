@@ -215,8 +215,16 @@ def refresh_session(refresh_token: str) -> dict[str, Any]:
     status, data, _ = _request(
         "POST", f"{cfg['supabaseUrl']}/auth/v1/token?grant_type=refresh_token",
         body={"refresh_token": refresh_token}, headers=_sb_headers())
+    if status in (400, 401, 403):
+        # Refresh token revoked, expired or already used: a genuine sign-in problem.
+        raise GatekeeperError(
+            f"Session refresh rejected ({_sb_error(data, status)}) — run `auth login` again.", 401, data)
     if status >= 400 or not isinstance(data, dict) or not data.get("access_token"):
-        raise GatekeeperError(f"Session refresh failed: {_sb_error(data, status)}", 401, data)
+        # 429 / 5xx / malformed: transient. Keep the real status so callers
+        # (and agents reading the exit code) retry instead of re-authenticating.
+        raise GatekeeperError(
+            f"Session refresh failed temporarily ({_sb_error(data, status)}); retry shortly.",
+            status if status >= 400 else 502, data)
     return data
 
 

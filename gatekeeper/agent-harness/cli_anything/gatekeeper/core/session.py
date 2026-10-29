@@ -2,15 +2,18 @@
 
 The session (Supabase access + refresh token) is stored in
 ``$GATEKEEPER_HOME/session.json`` (default ``~/.cli-anything-gatekeeper``),
-mode 0600, written under an exclusive lock. ``GATEKEEPER_TOKEN`` in the
+mode 0600, replaced atomically; writers and refreshes serialize on
+``session.lock``. ``GATEKEEPER_TOKEN`` in the
 environment overrides the file — useful for CI and agents.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -40,26 +43,51 @@ def jwt_claims(token: str) -> dict[str, Any]:
         return {}
 
 
-def _locked_save_json(path: Path, data: dict[str, Any]) -> None:
-    """CLI-Anything session-locking pattern: open r+, lock, truncate inside lock."""
-    path.touch(mode=0o600, exist_ok=True)
-    os.chmod(path, 0o600)
-    with open(path, "r+", encoding="utf-8") as fh:
+@contextlib.contextmanager
+def _writer_lock():
+    """Serialize writers (and refreshes) across processes via session.lock."""
+    lock = home() / "session.lock"
+    with open(lock, "a+") as fh:
         try:
             import fcntl
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         except ImportError:  # Windows: best effort
             pass
-        fh.seek(0)
-        fh.truncate()
-        json.dump(data, fh, indent=2)
-        fh.flush()
+        try:
+            yield
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                pass
 
 
-def save(tokens: dict[str, Any], email: str | None = None) -> dict[str, Any]:
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write a 0600 temp file in the same directory, then os.replace() it.
+
+    Readers never see a truncated or partial file: they get either the old
+    session or the new one. (Truncate-in-place, even under an exclusive lock,
+    exposes an empty file to readers that don't take the lock.)
+    """
+    # mkstemp creates the file with mode 0600.
+    fd, tmp = tempfile.mkstemp(prefix=".session-", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def _record(tokens: dict[str, Any], email: str | None) -> dict[str, Any]:
     access = tokens["access_token"]
     claims = jwt_claims(access)
-    record = {
+    return {
         "base_url": gk.base_url(),
         "access_token": access,
         "refresh_token": tokens.get("refresh_token", ""),
@@ -67,7 +95,12 @@ def save(tokens: dict[str, Any], email: str | None = None) -> dict[str, Any]:
         "email": email or claims.get("email") or (tokens.get("user") or {}).get("email"),
         "saved_at": int(time.time()),
     }
-    _locked_save_json(session_path(), record)
+
+
+def save(tokens: dict[str, Any], email: str | None = None) -> dict[str, Any]:
+    record = _record(tokens, email)
+    with _writer_lock():
+        _atomic_write_json(session_path(), record)
     return record
 
 
@@ -77,17 +110,23 @@ def load() -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8") or "{}")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, OSError):
         return None
-    return data if data.get("access_token") else None
+    return data if isinstance(data, dict) and data.get("access_token") else None
 
 
 def clear() -> bool:
-    p = session_path()
-    if p.is_file():
-        p.unlink()
-        return True
+    with _writer_lock():
+        p = session_path()
+        if p.is_file():
+            p.unlink()
+            return True
     return False
+
+
+def _needs_refresh(s: dict[str, Any]) -> bool:
+    exp = int(s.get("expires_at") or 0)
+    return bool(exp) and exp - time.time() < REFRESH_MARGIN_S
 
 
 def get_token(required: bool = True) -> str | None:
@@ -102,12 +141,17 @@ def get_token(required: bool = True) -> str | None:
                 "Not signed in. Run `cli-anything-gatekeeper auth login <email>` "
                 "or set GATEKEEPER_TOKEN.", 401)
         return None
-    exp = int(s.get("expires_at") or 0)
-    if exp and exp - time.time() < REFRESH_MARGIN_S:
-        if not s.get("refresh_token"):
-            raise gk.GatekeeperError("Session expired — run `auth login` again.", 401)
-        fresh = gk.refresh_session(s["refresh_token"])
-        s = save(fresh, email=s.get("email"))
+    if _needs_refresh(s):
+        with _writer_lock():
+            # Another process may have refreshed while we waited for the lock;
+            # reusing its result avoids spending the (rotating) refresh token twice.
+            s = load() or s
+            if _needs_refresh(s):
+                if not s.get("refresh_token"):
+                    raise gk.GatekeeperError("Session expired — run `auth login` again.", 401)
+                fresh = gk.refresh_session(s["refresh_token"])
+                s = _record(fresh, s.get("email"))
+                _atomic_write_json(session_path(), s)
     return s["access_token"]
 
 

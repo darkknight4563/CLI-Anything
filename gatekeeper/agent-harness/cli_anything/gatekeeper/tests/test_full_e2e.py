@@ -47,6 +47,8 @@ class MockState:
     def __init__(self):
         self.requests: list[dict] = []
         self.evaluate_status = 200
+        self.health_status = 200
+        self.refresh_status = 200
         self.token = fx.make_jwt("buyer@example.com")
         self.refreshed = fx.make_jwt("buyer@example.com", exp_in=7200)
 
@@ -76,6 +78,8 @@ def make_handler(state: MockState, base: list[str]):
                                    "auth": self.headers.get("Authorization"),
                                    "apikey": self.headers.get("apikey")})
             if u.path == "/api/health":
+                if state.health_status != 200:
+                    return self._send(state.health_status, {"ok": False, "error": "model unavailable"})
                 return self._send(200, {"status": "ok"})
             if u.path == "/api/config":
                 return self._send(200, {"supabaseUrl": base[0], "supabaseAnonKey": "anon-key",
@@ -116,6 +120,8 @@ def make_handler(state: MockState, base: list[str]):
                                             "expires_in": 3600, "user": {"email": body["email"]}})
                 return self._send(403, {"msg": "Token has expired or is invalid"})
             if u.path == "/auth/v1/token":
+                if state.refresh_status != 200:
+                    return self._send(state.refresh_status, {"msg": "upstream busy"})
                 return self._send(200, {"access_token": state.refreshed, "refresh_token": "rt-2"})
             if u.path == "/api/evaluate":
                 if self.headers.get("Authorization") not in (f"Bearer {state.token}", f"Bearer {state.refreshed}"):
@@ -258,6 +264,35 @@ class TestErrors:
         state, _, env = mock
         _, d = jrun(["evaluate", str(fx.make_tender(tmp_path / "t")), "--dry-run"], env)
         assert d["dry_run"] and d["ready"] and not d["signed_in"]
+        assert not any(x["path"] == "/api/evaluate" for x in state.requests)
+
+
+class TestReviewFixes:
+    def test_unhealthy_json_is_one_document(self, mock):
+        state, _, env = mock
+        state.health_status = 503
+        r = run(["--json", "health"], env, check=False)
+        assert r.returncode == 1
+        d = json.loads(r.stdout)  # raises if two JSON documents were printed
+        assert d["ok"] is False and d["http_status"] == 503 and d["exit_code"] == 1 and d["error"]
+
+    def test_transient_refresh_failure_is_retryable_exit_1(self, mock):
+        state, _, env = mock
+        state.refresh_status = 503
+        jrun(["auth", "token", state.token, "--refresh-token", "rt"], env)
+        p = Path(env["GATEKEEPER_HOME"]) / "session.json"
+        s = json.loads(p.read_text())
+        s["expires_at"] = 1
+        p.write_text(json.dumps(s))
+        r, d = jrun(["reports", "list"], env, check=False)
+        assert r.returncode == 1 and d["http_status"] == 503 and "retry" in d["error"]
+        assert json.loads(p.read_text())["refresh_token"] == "rt"  # session kept for the retry
+
+    def test_fractional_weight_rejected_before_any_call(self, mock, tmp_path):
+        state, _, env = mock
+        env["GATEKEEPER_TOKEN"] = state.token
+        r, d = jrun(["evaluate", str(fx.make_tender(tmp_path / "t")), "-w", "technical=25.9"], env, check=False)
+        assert r.returncode == 1 and "whole percentage" in d["error"]
         assert not any(x["path"] == "/api/evaluate" for x in state.requests)
 
 

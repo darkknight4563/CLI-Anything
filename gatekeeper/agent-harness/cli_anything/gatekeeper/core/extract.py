@@ -5,9 +5,10 @@ module ports those rules exactly (evaluate.html): same accepted types, same
 10-file / 10 MB limits, the same DOCX paragraph/tab handling, the same XLSX
 "[Sheet N]" tab-separated layout, and the same scanned-PDF warning.
 
-One deliberate difference: self-closing empty XLSX cells (<c r="B4" s="1"/>,
-written by Excel for any formatted blank cell) are kept as empty columns. The
-web app's regex merges them into the next cell, shifting values left.
+One deliberate difference: XLSX cells are placed by their A1 reference, so
+blank cells — omitted entirely, or written self-closing (<c r="B4" s="1"/>)
+when formatted — stay as empty columns. The web app reads cells sequentially,
+which shifts BOM values left under the wrong headers.
 """
 
 from __future__ import annotations
@@ -55,7 +56,8 @@ def extract_xlsx(path: Path) -> str:
         if "xl/sharedStrings.xml" in names:
             ss = z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
             shared = [_xml_text(m) for m in re.findall(r"<si>([\s\S]*?)</si>", ss)]
-        sheets = sorted(n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+        sheets = sorted((n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+                        key=lambda n: int(re.search(r"sheet(\d+)", n).group(1)))
         if not sheets:
             raise ExtractError("not an Excel workbook")
         out = []
@@ -64,27 +66,56 @@ def extract_xlsx(path: Path) -> str:
             sheet_no = re.search(r"sheet(\d+)", name).group(1)
             out.append(f"[Sheet {sheet_no}]\n")
             for row in re.findall(r"<row[^>]*>([\s\S]*?)</row>", xml):
-                cells = []
-                # Self-closing <c .../> (formatted blank cells) must stay a column.
-                # The web app's regex swallows them, shifting BOM columns left.
-                for m in re.finditer(r"<c(\s[^>]*?)?/>|<c(\s[^>]*)?>([\s\S]*?)</c>", row):
-                    if m.group(0).endswith("/>") and m.group(3) is None:
-                        cells.append("")
-                        continue
-                    attrs, inner = m.group(2) or "", m.group(3)
-                    m = re.search(r"<v>([\s\S]*?)</v>", inner)
-                    v = m.group(1) if m else None
-                    if 't="s"' in attrs:
-                        try:
-                            cells.append(shared[int(v)])
-                        except (TypeError, ValueError, IndexError):
-                            cells.append("")
-                    elif 't="inlineStr"' in attrs:
-                        cells.append(_xml_text(inner))
-                    else:
-                        cells.append(html.unescape(v) if v is not None else "")
-                out.append("\t".join(cells) + "\n")
+                out.append("\t".join(_xlsx_row(row, shared)) + "\n")
     return "".join(out)
+
+
+_CELL_RE = re.compile(r"<c(\s[^>]*?)?/>|<c(\s[^>]*)?>([\s\S]*?)</c>")
+_REF_RE = re.compile(r'\br="([A-Z]+)\d+"')
+
+
+def _col_index(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _xlsx_row(row: str, shared: list[str]) -> list[str]:
+    """Cells of one <row>, placed by their A1 reference.
+
+    OOXML omits unformatted blank cells entirely and writes formatted blank
+    cells as self-closing <c .../>. Placing each value by its r="C2"
+    reference keeps every value under its own column header; cells without a
+    reference fall back to the next position. (The web app's sequential regex
+    gets both cases wrong, shifting BOM values left.)
+    """
+    cells: list[str] = []
+    for m in _CELL_RE.finditer(row):
+        self_closing = m.group(3) is None
+        attrs = (m.group(1) if self_closing else m.group(2)) or ""
+        if self_closing:
+            value = ""
+        else:
+            inner = m.group(3)
+            vm = re.search(r"<v>([\s\S]*?)</v>", inner)
+            v = vm.group(1) if vm else None
+            if 't="s"' in attrs:
+                try:
+                    value = shared[int(v)]
+                except (TypeError, ValueError, IndexError):
+                    value = ""
+            elif 't="inlineStr"' in attrs:
+                value = _xml_text(inner)
+            else:
+                value = html.unescape(v) if v is not None else ""
+        ref = _REF_RE.search(attrs)
+        idx = _col_index(ref.group(1)) if ref else len(cells)
+        if idx < len(cells):  # malformed/out-of-order reference: don't overwrite
+            idx = len(cells)
+        cells.extend([""] * (idx - len(cells)))
+        cells.append(value)
+    return cells
 
 
 def extract_pdf(path: Path) -> tuple[str, int]:

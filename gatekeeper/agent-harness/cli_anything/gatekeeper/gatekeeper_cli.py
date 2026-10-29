@@ -139,10 +139,13 @@ def health_cmd() -> None:
         r["billing_available"] = cfg.get("billingAvailable")
     except gk.GatekeeperError:
         r["billing_available"] = None
+    if not r["ok"]:
+        # One JSON document only: fold the error into the health object.
+        r.update({"error": "Gatekeeper health check failed", "exit_code": 1})
     _out(r, lambda d: click.echo(
         f"[{'OK' if d['ok'] else 'DOWN'}] {d['url']}  HTTP {d['http_status']}  {json.dumps(d['response'])}"))
-    if not r["ok"]:
-        _fail("Gatekeeper health check failed", 1, r["http_status"])
+    if not r["ok"] and not _in_repl:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

@@ -38,9 +38,14 @@ def parse_weights(spec: str | None) -> dict[str, int] | None:
         if k not in CRITERIA:
             raise ValueError(f"Unknown criterion '{k}'. Use: {', '.join(CRITERIA)}")
         try:
-            n = int(float(v))
+            f = float(v)
         except ValueError as exc:
             raise ValueError(f"Weight for {k} must be a number") from exc
+        # Whole percentages only ("25" or "25.0"). Truncating 25.9 → 25 would
+        # silently change the scoring model, or turn a 100.x% total into 100.
+        if not f.is_integer():
+            raise ValueError(f"Weight for {k} must be a whole percentage (got {v})")
+        n = int(f)
         if n < 0 or n > 100:
             raise ValueError(f"Weight for {k} must be 0-100")
         w[k] = n

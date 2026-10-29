@@ -243,3 +243,137 @@ class TestReport:
     def test_empty_report(self):
         md = report.to_markdown({"vendors": []})
         assert "No award recommended" in md
+
+
+# ---------------------------------------------------------------- review fixes (PR #633)
+
+def _xlsx(tmp_path, sheets: dict[str, str], shared=("Item", "Qty", "Total")):
+    import zipfile
+    p = tmp_path / "w.xlsx"
+    ss = "<sst>" + "".join(f"<si><t>{s}</t></si>" for s in shared) + "</sst>"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("xl/sharedStrings.xml", ss)
+        for name, rows in sheets.items():
+            z.writestr(f"xl/worksheets/{name}.xml", f"<worksheet><sheetData>{rows}</sheetData></worksheet>")
+    return p
+
+
+class TestXlsxCellReferences:
+    def test_omitted_blank_cell_keeps_column(self, tmp_path):
+        # A2 and C2 present, B2 omitted entirely (unformatted blank in OOXML).
+        rows = ('<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>'
+                '<row r="2"><c r="A2" t="inlineStr"><is><t>Umbilical</t></is></c><c r="C2"><v>18000000</v></c></row>')
+        c = extract.extract_xlsx(_xlsx(tmp_path, {"sheet1": rows}))
+        assert "Item\tQty\tTotal\nUmbilical\t\t18000000\n" in c
+
+    def test_leading_gap_and_self_closing(self, tmp_path):
+        rows = '<row r="3"><c r="B3" s="1"/><c r="D3"><v>7</v></c></row>'
+        assert extract.extract_xlsx(_xlsx(tmp_path, {"sheet1": rows})).endswith("\t\t\t7\n")
+
+    def test_multi_letter_columns(self, tmp_path):
+        rows = '<row r="1"><c r="A1"><v>1</v></c><c r="AA1"><v>2</v></c></row>'
+        line = extract.extract_xlsx(_xlsx(tmp_path, {"sheet1": rows})).splitlines()[1]
+        assert line.split("\t") == ["1"] + [""] * 25 + ["2"]
+
+    def test_cells_without_reference_are_sequential(self, tmp_path):
+        rows = '<row><c><v>1</v></c><c><v>2</v></c></row>'
+        assert "1\t2\n" in extract.extract_xlsx(_xlsx(tmp_path, {"sheet1": rows}))
+
+    def test_out_of_order_reference_does_not_overwrite(self, tmp_path):
+        rows = '<row r="1"><c r="B1"><v>1</v></c><c r="A1"><v>2</v></c></row>'
+        assert extract.extract_xlsx(_xlsx(tmp_path, {"sheet1": rows})).splitlines()[1] == "\t1\t2"
+
+    def test_sheets_in_numeric_order(self, tmp_path):
+        sheets = {f"sheet{i}": f'<row><c t="inlineStr"><is><t>s{i}</t></is></c></row>' for i in (1, 2, 10)}
+        c = extract.extract_xlsx(_xlsx(tmp_path, sheets))
+        assert c.index("[Sheet 2]") < c.index("[Sheet 10]")
+
+
+class TestFractionalWeights:
+    def test_fraction_rejected(self):
+        with pytest.raises(ValueError, match="whole percentage"):
+            evaluate.parse_weights("technical=25.9")
+
+    def test_fraction_cannot_sneak_total_to_100(self):
+        with pytest.raises(ValueError, match="whole percentage"):
+            evaluate.parse_weights("technical=25.9,pricing=19.1")
+
+    def test_integer_valued_float_accepted(self):
+        assert evaluate.parse_weights("technical=25.0") is None
+        assert evaluate.parse_weights("technical=30.0,pricing=15")["technical"] == 30
+
+
+class TestRefreshErrorMapping:
+    def _patch(self, monkeypatch, status, body):
+        monkeypatch.setattr(gk, "get_config", lambda: {"supabaseUrl": "https://sb", "supabaseAnonKey": "k"})
+        monkeypatch.setattr(gk, "_request", lambda *a, **k: (status, body, {}))
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_auth_rejection_is_401(self, monkeypatch, status):
+        self._patch(monkeypatch, status, {"error_description": "Invalid Refresh Token"})
+        with pytest.raises(gk.GatekeeperError) as ei:
+            gk.refresh_session("rt")
+        assert ei.value.status == 401 and "auth login" in str(ei.value)
+
+    @pytest.mark.parametrize("status", [429, 500, 503])
+    def test_transient_failure_keeps_status(self, monkeypatch, status):
+        self._patch(monkeypatch, status, {"msg": "busy"})
+        with pytest.raises(gk.GatekeeperError) as ei:
+            gk.refresh_session("rt")
+        assert ei.value.status == status and "retry" in str(ei.value)
+
+    def test_malformed_success_is_not_auth(self, monkeypatch):
+        self._patch(monkeypatch, 200, {"unexpected": True})
+        with pytest.raises(gk.GatekeeperError) as ei:
+            gk.refresh_session("rt")
+        assert ei.value.status == 502
+
+
+class TestSessionConcurrency:
+    def test_reader_never_sees_partial_file(self):
+        import threading
+        session.save({"access_token": fx.make_jwt(), "refresh_token": "r0"})
+        stop, misses = threading.Event(), []
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                session.save({"access_token": fx.make_jwt(), "refresh_token": f"r{i}" * 200})
+                i += 1
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            for _ in range(3000):
+                if session.load() is None:
+                    misses.append(1)
+        finally:
+            stop.set()
+            t.join()
+        assert not misses
+        assert not list(session.home().glob(".session-*"))  # no temp files left behind
+
+    def test_concurrent_refresh_spends_token_once(self, monkeypatch):
+        import threading
+        session.save({"access_token": fx.make_jwt(exp_in=30), "refresh_token": "r1"})
+        calls, new = [], fx.make_jwt(exp_in=3600)
+
+        def refresh(rt):
+            calls.append(rt)
+            time.sleep(0.2)
+            return {"access_token": new, "refresh_token": "r2"}
+
+        monkeypatch.setattr(gk, "refresh_session", refresh)
+        out = []
+        threads = [threading.Thread(target=lambda: out.append(session.get_token())) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert calls == ["r1"] and out == [new] * 4
+
+    def test_session_file_mode_after_atomic_write(self):
+        import stat as _stat
+        session.save({"access_token": fx.make_jwt()})
+        session.save({"access_token": fx.make_jwt()})
+        assert _stat.S_IMODE(os.stat(session.session_path()).st_mode) == 0o600

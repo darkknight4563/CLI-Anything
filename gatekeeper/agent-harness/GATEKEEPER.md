@@ -22,8 +22,8 @@ HTTP status mapping: `401 → exit 2`, `402 → exit 3`, other failures `→ exi
 ## Extraction parity
 The web app extracts text in the browser and posts only text. `core/extract.py` ports those
 rules (types, 10-file / 10 MB limits, DOCX paragraphs/tabs, XLSX `[Sheet N]` TSV, scanned-PDF
-warning), with one fix: formatted blank XLSX cells (`<c …/>`) keep their column instead of
-being merged into the next cell.
+warning), with one fix: XLSX cells are placed by their A1 reference (`r="C2"`), so blank cells —
+omitted, or self-closing when formatted — keep their column instead of shifting values left.
 
 ## Command hierarchy
 ```
@@ -38,9 +38,12 @@ cli-anything-gatekeeper [--json] [--url URL]
 ```
 
 ## State
-`~/.cli-anything-gatekeeper/session.json` (override with `GATEKEEPER_HOME`), mode 0600, written
-with the HARNESS session-locking pattern. Access tokens refresh automatically within 120 s of
-expiry. `GATEKEEPER_TOKEN` overrides the file.
+`~/.cli-anything-gatekeeper/session.json` (override with `GATEKEEPER_HOME`), mode 0600. Writes go
+to a temp file that is `os.replace`d into place, so readers never see a partial file; writers and
+token refreshes serialize on `session.lock`, and a refresh re-checks the session under the lock so
+Supabase's rotating refresh token is spent once. Access tokens refresh automatically within 120 s
+of expiry. Only an auth rejection of the refresh (400/401/403) means "sign in again" (exit 2);
+429/5xx keep their status (exit 1, retry). `GATEKEEPER_TOKEN` overrides the file.
 
 ## File layout
 ```
